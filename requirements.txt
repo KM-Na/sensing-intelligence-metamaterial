@@ -1,0 +1,12 @@
+numpy>=1.24
+scipy>=1.10
+jax>=0.4
+jaxlib>=0.4
+jax-md>=0.2
+diffrax>=0.4
+equinox>=0.11
+flax>=0.8
+optax>=0.1
+tqdm>=4.65
+jaxopt>=0.8
+matplotlib>=3.7
