@@ -20,7 +20,7 @@ class minmax_scaler():
   
   def inverse_transform(self, data_normalized, output_normalized):
     data_original = (data_normalized + 1.0) * (self.data_max - self.data_min) / 2.0 + self.data_min
-    output_original = output_normalized * (self.output_data_max + self.output_data_min) + self.output_data_min
+    output_original = output_normalized * (self.output_data_max - self.output_data_min) + self.output_data_min
     return data_original, output_original
 
   def information(self):
