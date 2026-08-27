@@ -23,6 +23,7 @@ parser.add_argument(
     help='One or more measurement indices (e.g. --measure-idx 25 29 41).'
 )
 parser.add_argument('--gpu', type=int, default=0, help='GPU number')
+parser.add_argument('--smoke-test', action='store_true', help='Validate imports and CLI setup without running optimization')
 args = parser.parse_args()
 measure_idx_tag = "_".join(str(idx) for idx in args.measure_idx)
 
@@ -67,6 +68,30 @@ from typing import Callable, Optional, Union, Any, Sequence, Literal, List, Tupl
 # tqdm for progress bars
 from tqdm.auto import tqdm
 
+# Plotting and matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.pyplot import cm
+import matplotlib as mpl
+from cycler import cycler
+
+mpl.rcParams['axes.prop_cycle'] = cycler(color='brgcmyk')
+plt.rcParams['axes.grid'] = True
+plt.rcParams['grid.color'] = '#808080'
+plt.rcParams['grid.linestyle'] = '--'
+plt.rcParams['grid.linewidth'] = 0.5
+mpl.rcParams['legend.fontsize'] = 16
+mpl.rcParams['figure.titlesize'] = 18
+mpl.rcParams['axes.titlesize'] = 18
+mpl.rcParams['lines.linewidth'] = 2.0
+mpl.rcParams['axes.labelsize'] = 18
+mpl.rcParams['xtick.labelsize'] = 14
+mpl.rcParams['ytick.labelsize'] = 14
+plt.rcParams['axes.xmargin'] = 0
+plt.rcParams["figure.figsize"] = (6.4, 4.8)
+plt.rcParams['text.usetex'] = True
+plt.rcParams["font.family"] = "serif"
+
+
 # Local project imports
 from blockymetamaterials.utils import (
     SolutionType, SolutionData, ControlParams, GeometricalParams, MechanicalParams, LigamentParams, ContactParams
@@ -80,10 +105,109 @@ from blockymetamaterials.energy import (
     build_contact_energy, combine_block_energies, compute_ligament_strains_history, constrain_energy
 )
 
-from blockymetamaterials.kinematics import build_constrained_kinematics
-from blockymetamaterials.loading import build_loading, build_viscous_damping
-from blockymetamaterials.dynamics import build_RHS
+if args.smoke_test:
+    print("Smoke test passed: imports and CLI setup are valid.")
+    raise SystemExit(0)
 
+
+import diffrax
+from typing import Callable, Optional, Union
+from flax import linen as nn
+from flax.training.train_state import TrainState
+import optax
+from jax_md.quantity import force
+import equinox as eqx
+from tqdm import trange, tqdm
+
+def build_viscous_damping(
+        geometry: Geometry,
+        damped_DOF_ids: jnp.ndarray,
+        free_DOF_ids: jnp.ndarray,
+        constrained_DOF_ids: jnp.ndarray,
+        all_DOF_ids: jnp.ndarray):
+
+    # This is to ensure correct shape of loading vector when damping is either a scalar or an array of shape (n_damped_blocks, 3)
+    reshaping_array = jnp.ones((damped_DOF_ids.shape[0]//3, 3))
+
+    def loading_fn(state, t, damping: jnp.ndarray):
+        _, velocity = state
+        loading_vector = jnp.zeros((len(all_DOF_ids),))
+        loading_vector = loading_vector.at[damped_DOF_ids].set(
+            (damping * reshaping_array).reshape(damped_DOF_ids.shape)
+        )
+        loading_vector = loading_vector[free_DOF_ids]
+
+        return -loading_vector * velocity
+
+    return loading_fn
+
+
+def build_loading(
+        geometry: Geometry,
+        loaded_DOF_ids: jnp.ndarray,
+        loading_fn: Callable,
+        free_DOF_ids: jnp.ndarray,
+        constrained_DOF_ids: jnp.ndarray,
+        all_DOF_ids: jnp.ndarray):
+
+    def global_loading_fn(state, t, loading_params: Dict):
+
+        loading_vector = jnp.zeros((len(all_DOF_ids),))
+        
+        loading_vector = loading_vector.at[loaded_DOF_ids].set(
+            loading_fn(state, t, **loading_params)
+        )
+        loading_vector = loading_vector[free_DOF_ids]  # Reduce loading vector to the free DOFs
+
+        return loading_vector
+
+    return global_loading_fn
+
+
+def build_constrained_kinematics(
+        geometry: Geometry,
+        constrained_block_DOF_pairs: jnp.ndarray,
+        free_DOF_ids: jnp.ndarray,
+        constrained_DOF_ids: jnp.ndarray,
+        all_DOF_ids: jnp.ndarray,
+        constrained_DOFs_fn: Callable = lambda t,
+        **kwargs: 0):
+
+    def constrained_kinematics(free_DOFs: jnp.ndarray, t, constraint_params: Dict = dict()):
+
+        all_DOFs = jnp.zeros((len(all_DOF_ids),))
+        # Assign imposed displacements along the constrained DOFs
+        if len(constrained_DOF_ids) != 0:
+            all_DOFs = all_DOFs.at[constrained_DOF_ids].set(
+                constrained_DOFs_fn(t, **constraint_params)
+            )
+
+        # Simply assign the free_DOFs along the free DOFs (this acts as the identity operator)
+        all_DOFs = all_DOFs.at[free_DOF_ids].set(
+            free_DOFs
+        )
+        return all_DOFs.reshape((geometry.n_blocks, 3))
+
+    return constrained_kinematics
+
+def build_RHS(energy_fn: Callable, loading_fn: Callable):
+
+    potential_force = force(energy_fn)
+
+    @jit
+    def rhs(t, state: jnp.ndarray, args):
+        control_params, inertia = args
+        loading_params = control_params.loading_params
+        damping = control_params.mechanical_params.damping
+        displacement, velocity = state
+
+        dxdt = jnp.array([
+            velocity,
+            (potential_force(displacement, t, control_params) + loading_fn(state, t, loading_params, damping)) / inertia
+        ])
+        return dxdt
+
+    return rhs
 
 def setup_dynamic_solver(
         geometry: Geometry,
@@ -192,6 +316,13 @@ def setup_dynamic_solver(
                                                 max_steps=1000000) 
 
         free_DOFs_solution = solution.ys
+
+        # Reshape solution to global state.
+        # displacement_history = displacement_history_fn(
+        #     free_DOFs_solution[:, 0, :],
+        #     timepoints,
+        #     control_params.constraint_params
+        # )
         
         velocity_history = velocity_history_fn(
             free_DOFs_solution[:, 0, :],
@@ -261,11 +392,11 @@ class TimeSeriesCNN(nn.Module):
         x = nn.Conv(self.output_features, kernel_size=(1,), padding='SAME')(x)  # Final output: 2 channels
         return x  # Shape: (batch_size, time_steps, 2)
     
-# Simulation setting
-n1_blocks = 23
+
+n1_blocks = 11
 n2_blocks = 6
-n_source = 8
-spacing = 15. + 0.075*15.  # 15 mm
+n_source = 4
+spacing = 15. + 0.075*15.  # 1.0  # 15 mm
 hinge_length = 0.075*15.  # Same as bond length
 initial_angle = -25.0*jnp.pi/180
 horizontal_shifts, vertical_shifts = QuadGeometry_InputSource(n1_blocks, n2_blocks, spacing=spacing, bond_length=hinge_length, n_source=n_source).get_design_from_rotated_square(
@@ -273,11 +404,15 @@ horizontal_shifts, vertical_shifts = QuadGeometry_InputSource(n1_blocks, n2_bloc
 )  # Initial design
 
 # Mechanical params
-k_stretch = 4.00  # stretching stiffness N/mm
-k_shear = k_stretch * 2.1e-01 # shearing stiffness N/mm
-k_rot = k_stretch * 2.6902e-03 * 20.0 # rotational stiffness Nmm
+k_stretch = 4.00  # stretching stiffness 120. N/mm
+k_shear = k_stretch * 2.1e-01 # shearing stiffness 1.19 N/mm
+k_rot = k_stretch * 2.6902e-03 * 20.0 # rotational stiffness 1.50 Nmm
 
-# Dynamic loading for reference
+# NOTE: Damping is assumed to be the same for all blocks as it is small enough that the inertia change during optimization is negligible.
+# The reference is taken to be zero angle rotated square geometry.
+# 0.36125, 0.02175026 = mass and inertia of a single square of zero angle and unitary spacing and density and 0.15 bond length.
+
+# Dynamic loading (default setting)
 amplitude = jnp.ones((n1_blocks,)) * spacing  # 0.5 * spacing default 
 loading_rate = 30.0 * jnp.ones((n1_blocks,))# jnp.array([30., 0., 20., 20., 20.])  #  Hz loading frequency for dynamic input
 input_shift = 0
@@ -406,7 +541,6 @@ areas = jnp.stack([ polygon_area(vertice) for vertice in vertices ], axis=0)
 area_moments = jnp.stack([ polygon_polar_moment(vertice) for vertice in vertices ], axis=0)
 print("areas : ", areas)
 
-
 sensor_mass = 8.58 * 1e-6 # g * 1e-6 for Mg
 sensor_moment = 1/12 * (32**2+23**2) * sensor_mass # 
 # density_arr = density_arr.at[target_blocks].set( density + sensor_density )  # increase density of target block
@@ -508,7 +642,7 @@ N = 300
 
 # Data load ----------------------------------------------------------------
 # Check if file exists, if it does, read the data; otherwise, generate input data
-filename = f"Simulation/input_source_8_training_dataset_measure_idx_{measure_idx_tag}.pickle"
+filename = f"Simulation/input_source_4_training_dataset_measure_idx_{measure_idx_tag}.pickle"
 print("Checking for data file at:", filename)
 
 if os.path.exists(filename):
@@ -521,7 +655,7 @@ if os.path.exists(filename):
     nest_forward_problem = lambda inputs : vmap(forward_problem, in_axes=(None,0,None,None,None))(inputs, output_data, free_DOF_ids, constrained_DOF_ids, all_DOF_ids)
 else:
     print("Generating data and saving to file...")
-    data_path = "Simulation/input_source_8_training_dataset.pkl"
+    data_path = "Simulation/input_source_4_training_dataset.pkl"
     with open(data_path, "rb") as f:
         data_dict = pickle.load(f)
     output_data = data_dict["output_data"] # force function set
@@ -652,7 +786,7 @@ for it in pbar:
                     "nn_record": in_param_record,
                     "loss_record": outer_losses}
 
-    with open(time_string+f"_cooptimization_sim_1DCNN_data_300_n_source_{n_source}_measure_idx_{measure_idx_tag}.pickle", "wb") as f:
+    with open(time_string+f"_cooptimization_sim_1DCNN_data_300_n_source_{n_source}_measure_idx_{measure_idx_tag}_without_contact.pickle", "wb") as f:
         pickle.dump(record_dict, f)
 
 print("time : ", time.time()-start_time)

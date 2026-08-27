@@ -19,11 +19,13 @@ reproduce the visualization notebooks for Figures 2-5.
 - `notebooks/figure3_experimental_force.ipynb`: Figure 3 visualization notebook.
 - `notebooks/figure4_sensor_count_loss.ipynb`: Figure 4 visualization notebook.
 - `notebooks/figure5_circular_structure_complexity.ipynb`: Figure 5 visualization notebook.
-- `scripts/cooptimization_input_source_4_multiple_sensors.py`: 4-input-source
+- `scripts/cooptimize_square_4_input_sources.py`: 4-input-source square
+  structure co-optimization script.
+- `scripts/cooptimize_square_8_input_sources.py`: 8-input-source square
+  structure co-optimization script.
+- `scripts/cooptimize_circular_structure.py`: Circular-structure
   co-optimization script.
-- `scripts/cooptimization_input_source_8_multiple_sensors.py`: 8-input-source
-  co-optimization script.
-- `scripts/cooptimization_circular_robot_multiple_sensors.py`: Circular-structure
+- `scripts/cooptimization.py`: Helper functions used by the circular-structure
   co-optimization script.
 - `scripts/export_figure_data.py`: Regenerates the compact `data/*.npz` files
   from the original `physical-intelligence-change` folder.
@@ -51,4 +53,13 @@ Open the notebooks in `notebooks/` from the repository root, or start Jupyter:
 
 ```bash
 jupyter lab
+```
+
+## Smoke-Test Scripts
+
+```bash
+python scripts/cooptimize_square_4_input_sources.py --smoke-test
+python scripts/cooptimize_square_8_input_sources.py --smoke-test
+python scripts/cooptimize_circular_structure.py --smoke-test
+python -m py_compile scripts/*.py
 ```

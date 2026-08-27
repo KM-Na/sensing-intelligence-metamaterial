@@ -23,6 +23,7 @@ parser.add_argument(
     help='One or more measurement indices (e.g. --measure-idx 25 29 41).'
 )
 parser.add_argument('--gpu', type=int, default=0, help='GPU number')
+parser.add_argument('--smoke-test', action='store_true', help='Validate imports and CLI setup without running optimization')
 args = parser.parse_args()
 measure_idx_tag = "_".join(str(idx) for idx in args.measure_idx)
 
@@ -67,23 +68,42 @@ from typing import Callable, Optional, Union, Any, Sequence, Literal, List, Tupl
 # tqdm for progress bars
 from tqdm.auto import tqdm
 
-# Local project imports
-from blockymetamaterials.utils import (
-    SolutionType, SolutionData, ControlParams, GeometricalParams, MechanicalParams, LigamentParams, ContactParams
-)
-from blockymetamaterials.geometry import (
-    Geometry, QuadGeometry, compute_inertia, compute_edge_angles, compute_edge_lengths, DOFsInfo,
-    QuadGeometry_InputSource, polygon_area, polygon_polar_moment
-)
-from blockymetamaterials.energy import (
-    build_strain_energy, kinetic_energy, ligament_energy, ligament_energy_linearized,
-    build_contact_energy, combine_block_energies, compute_ligament_strains_history, constrain_energy
-)
+# Plotting and matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.pyplot import cm
+import matplotlib as mpl
+from cycler import cycler
 
-from blockymetamaterials.kinematics import build_constrained_kinematics
-from blockymetamaterials.loading import build_loading, build_viscous_damping
-from blockymetamaterials.dynamics import build_RHS
+mpl.rcParams['axes.prop_cycle'] = cycler(color='brgcmyk')
+plt.rcParams['axes.grid'] = True
+plt.rcParams['grid.color'] = '#808080'
+plt.rcParams['grid.linestyle'] = '--'
+plt.rcParams['grid.linewidth'] = 0.5
+mpl.rcParams['legend.fontsize'] = 16
+mpl.rcParams['figure.titlesize'] = 18
+mpl.rcParams['axes.titlesize'] = 18
+mpl.rcParams['lines.linewidth'] = 2.0
+mpl.rcParams['axes.labelsize'] = 18
+mpl.rcParams['xtick.labelsize'] = 14
+mpl.rcParams['ytick.labelsize'] = 14
+plt.rcParams['axes.xmargin'] = 0
+plt.rcParams["figure.figsize"] = (6.4, 4.8)
+plt.rcParams['text.usetex'] = True
+plt.rcParams["font.family"] = "serif"
 
+
+# # Local project imports
+# from blockymetamaterials.utils import (
+#     SolutionType, SolutionData, ControlParams, GeometricalParams, MechanicalParams, LigamentParams, ContactParams
+# )
+# from blockymetamaterials.geometry import (
+#     Geometry, QuadGeometry, compute_inertia, compute_edge_angles, compute_edge_lengths, DOFsInfo,
+#     QuadGeometry_InputSource, polygon_area, polygon_polar_moment
+# )
+# from blockymetamaterials.energy import (
+#     build_strain_energy, kinetic_energy, ligament_energy, ligament_energy_linearized,
+#     build_contact_energy, combine_block_energies, compute_ligament_strains_history, constrain_energy
+# )
 
 from blockymetamaterials.utils import SolutionType, SolutionData, ControlParams, GeometricalParams, MechanicalParams, LigamentParams, ContactParams
 # from blockymetamaterials.geometry import Geometry, QuadGeometry, compute_inertia, compute_edge_angles, compute_edge_lengths, DOFsInfo, QuadGeometry_Circle_InputSource, polygon_area, polygon_polar_moment
@@ -93,6 +113,11 @@ from typing import Any, Literal, Optional, List, Union, Tuple, Dict
 import dataclasses
 from dataclasses import dataclass
 from itertools import combinations
+from cooptimization import setup_dynamic_solver, setup_dynamic_solver_all
+
+if args.smoke_test:
+    print("Smoke test passed: imports and CLI setup are valid.")
+    raise SystemExit(0)
 
 import diffrax
 from typing import Callable, Optional, Union
@@ -103,6 +128,95 @@ from jax_md.quantity import force
 import equinox as eqx
 from tqdm import trange, tqdm
 
+def build_viscous_damping(
+        geometry: Geometry,
+        damped_DOF_ids: jnp.ndarray,
+        free_DOF_ids: jnp.ndarray,
+        constrained_DOF_ids: jnp.ndarray,
+        all_DOF_ids: jnp.ndarray):
+
+    # This is to ensure correct shape of loading vector when damping is either a scalar or an array of shape (n_damped_blocks, 3)
+    reshaping_array = jnp.ones((damped_DOF_ids.shape[0]//3, 3))
+
+    def loading_fn(state, t, damping: jnp.ndarray):
+        _, velocity = state
+        loading_vector = jnp.zeros((len(all_DOF_ids),))
+        loading_vector = loading_vector.at[damped_DOF_ids].set(
+            (damping * reshaping_array).reshape(damped_DOF_ids.shape)
+        )
+        loading_vector = loading_vector[free_DOF_ids]
+
+        return -loading_vector * velocity
+
+    return loading_fn
+
+
+def build_loading(
+        geometry: Geometry,
+        loaded_DOF_ids: jnp.ndarray,
+        loading_fn: Callable,
+        free_DOF_ids: jnp.ndarray,
+        constrained_DOF_ids: jnp.ndarray,
+        all_DOF_ids: jnp.ndarray):
+
+    def global_loading_fn(state, t, loading_params: Dict):
+
+        loading_vector = jnp.zeros((len(all_DOF_ids),))
+        
+        loading_vector = loading_vector.at[loaded_DOF_ids].set(
+            loading_fn(state, t, **loading_params)
+        )
+        loading_vector = loading_vector[free_DOF_ids]  # Reduce loading vector to the free DOFs
+
+        return loading_vector
+
+    return global_loading_fn
+
+
+def build_constrained_kinematics(
+        geometry: Geometry,
+        constrained_block_DOF_pairs: jnp.ndarray,
+        free_DOF_ids: jnp.ndarray,
+        constrained_DOF_ids: jnp.ndarray,
+        all_DOF_ids: jnp.ndarray,
+        constrained_DOFs_fn: Callable = lambda t,
+        **kwargs: 0):
+
+    def constrained_kinematics(free_DOFs: jnp.ndarray, t, constraint_params: Dict = dict()):
+
+        all_DOFs = jnp.zeros((len(all_DOF_ids),))
+        # Assign imposed displacements along the constrained DOFs
+        if len(constrained_DOF_ids) != 0:
+            all_DOFs = all_DOFs.at[constrained_DOF_ids].set(
+                constrained_DOFs_fn(t, **constraint_params)
+            )
+
+        # Simply assign the free_DOFs along the free DOFs (this acts as the identity operator)
+        all_DOFs = all_DOFs.at[free_DOF_ids].set(
+            free_DOFs
+        )
+        return all_DOFs.reshape((geometry.n_blocks, 3))
+
+    return constrained_kinematics
+
+def build_RHS(energy_fn: Callable, loading_fn: Callable):
+
+    potential_force = force(energy_fn)
+
+    @jit
+    def rhs(t, state: jnp.ndarray, args):
+        control_params, inertia = args
+        loading_params = control_params.loading_params
+        damping = control_params.mechanical_params.damping
+        displacement, velocity = state
+
+        dxdt = jnp.array([
+            velocity,
+            (potential_force(displacement, t, control_params) + loading_fn(state, t, loading_params, damping)) / inertia
+        ])
+        return dxdt
+
+    return rhs
 
 def setup_dynamic_solver(
         geometry: Geometry,
@@ -200,6 +314,7 @@ def setup_dynamic_solver(
 
         # Solve ODE
         solver = diffrax.Tsit5()
+        # solver = diffrax.Kvaerno5()
         saveat = diffrax.SaveAt(ts=timepoints)
 
         solution = diffrax.diffeqsolve(diffrax.ODETerm(rhs), solver,
@@ -229,9 +344,10 @@ def setup_dynamic_solver(
         n_measure = measure_idx.shape[0]
         solution = jnp.zeros((len(timepoints), n_measure, 3))
 
-        solution = solution.at[:,:,:2].set( acceleration_history[:,measure_idx,0:2] )
-        solution = solution.at[:,:,-1].set( velocity_history[:,measure_idx,-1] )
-        solution = solution.reshape((len(timepoints), -1))
+        # solution = solution.at[:,:,:2].set( acceleration_history[:,measure_idx,0:2] )
+        # solution = solution.at[:,:,-1].set( velocity_history[:,measure_idx,-1] )
+        solution = velocity_history[:,measure_idx,:].squeeze() # (len(timepoints), 3)
+    
         print( "solution shape : ", solution.shape )
         return solution
 
@@ -294,10 +410,11 @@ horizontal_shifts, vertical_shifts = QuadGeometry_Circle_InputSource(n1_blocks, 
 
 # use previous parameters
 # Mechanical params
-k_stretch = 4.00  # stretching stiffness 120. N/mm
-k_shear = k_stretch * 2.1e-01 # shearing stiffness 1.19 N/mm
-k_rot = k_stretch * 2.6902e-03 * 20.0 # rotational stiffness 1.50 Nmm
-density = 3.2325226e-08 # 0.03859661 * 1e-6  # Mg/mm^2
+k_stretch = 120.  # stretching stiffness 120. N/mm
+k_shear = 1.19  # shearing stiffness 1.19 N/mm
+k_rot = 1.50  # rotational stiffness 1.50 Nmm
+density = 6.18e-9  # Mg/mm^2
+
 
 # Dynamic loading (I don't use these parameters)----------
 amplitude = 0.5 * spacing  # 0.5 * spacing default 
@@ -307,7 +424,7 @@ input_delay = 0.1*30.0**-1 * jnp.ones((n1_blocks,))
 min_angle=-15*jnp.pi/180
 cutoff_angle=-10*jnp.pi/180
 
-simulation_time = 1.0
+simulation_time = 0.5
 n_timepoints = 200
 bond_length = hinge_length
 linearized_strains = False
@@ -332,18 +449,11 @@ k_rot_arr = k_rot * jnp.ones((_bond_connectivity.shape[0],)) # rotational stiffn
 # NOTE: Damping is assumed to be the same for all blocks as it is small enough that the inertia change during optimization is negligible.
 # The reference is taken to be zero angle rotated square geometry.
 # 0.36125, 0.02175026 = mass and inertia of a single square of zero angle and unitary spacing and density and 0.15 bond length.
-dampall = 0.624118 
-dampxy = 0.884512
-damprot = 0.85392
-
-damping_params = jnp.array([dampall * 0.186, dampxy * 0.36125, damprot * 0.02175026])
-print( "initial damping params : ", damping_params )
-damping = damping_params[0] * jnp.array([
-    2 * (damping_params[1] * density * spacing**2 * k_shear)**0.5,
-    2 * (damping_params[1] * density * spacing**2 * k_shear)**0.5,
-    2 * (damping_params[2] * density * spacing**4 * k_rot)**0.5
+damping = 0.0186 * jnp.array([
+    2 * (0.36125 * density * spacing**2 * k_shear)**0.5,
+    2 * (0.36125 * density * spacing**2 * k_shear)**0.5,
+    2 * (0.02175026 * density * spacing**4 * k_rot)**0.5
 ]) * jnp.ones((geometry.n_blocks, 3))
-
 
 # Damping
 damped_blocks = jnp.arange(geometry.n_blocks)
@@ -358,8 +468,14 @@ driven_block_DOF_pairs = jnp.array([
 ]).T
 print("driven_block_DOF_pairs", driven_block_DOF_pairs)
 
-# No constrained blocks
+
 constrained_block_DOF_pairs = jnp.zeros((0,2), dtype=int)
+
+# clamped_blocks_ids = jnp.unique(
+#     jnp.concatenate([
+#         clamped_block_DOF_pairs
+#     ])[:, 0]
+# )
 
 driven_blocks_ids = jnp.unique( driven_block_DOF_pairs[:, 0] )
 constrained_DOFs_loading_vector = jnp.zeros((len(constrained_block_DOF_pairs),))
@@ -404,7 +520,15 @@ rtol = 1e-4
 free_DOF_ids, constrained_DOF_ids, all_DOF_ids = DOFsInfo(geometry.n_blocks, constrained_block_DOF_pairs)
 damped_DOF_ids = jnp.concatenate([jnp.arange(block_id * 3, (block_id + 1) * 3) for block_id in damped_blocks])
 
+target_size = (1, 1)
+target_shift = (0, 0)
 ts = jnp.linspace(0, simulation_time, n_timepoints)
+
+target_blocks = jnp.array([
+    j * n1_blocks + i
+    for i in range((n1_blocks-target_size[0])//2 + target_shift[0], (n1_blocks+target_size[0])//2 + target_shift[0])
+    for j in range((n2_blocks-target_size[1])//2 + target_shift[1], (n2_blocks+target_size[1])//2 + target_shift[1])
+])
 
 vertices = centroid_node_vectors(horizontal_shifts, vertical_shifts)
 areas = jnp.stack([ polygon_area(vertice) for vertice in vertices ], axis=0)
@@ -412,15 +536,23 @@ area_moments = jnp.stack([ polygon_polar_moment(vertice) for vertice in vertices
 
 density_arr = jnp.ones( (len(areas)) ) * density
 density_arr = density_arr.at[geometry.n_quads:].set(2.0 * density) # shell blocks are heavier than inner blocks
-
-target_blocks = jnp.array(args.measure_idx)
-print( "target blocks : ", target_blocks )
-density_arr = density_arr.at[target_blocks].set( density + 0.007301278265064265 * 1e-6  )
 translational_inertia = density_arr * areas
 rotational_inertia = density_arr * area_moments
 
+translational_inertia = density * areas
+rotational_inertia = density * area_moments
 
 _inertia = jnp.column_stack((translational_inertia, translational_inertia, rotational_inertia))
+
+# Increase 
+# _inertia = compute_inertia(
+#     vertices=centroid_node_vectors(horizontal_shifts, vertical_shifts),
+#     density=density
+# )
+# print(_inertia.shape)
+# _inertia = _inertia.at[target_blocks[0],:].set(_inertia[target_blocks[0],:] * 10.)
+# # print(_inertia)
+# _inertia = _inertia.reshape((geometry.n_blocks * 3,))
 
 @eqx.filter_jit
 def forward_problem(inputs, output_data, free_DOF_ids, constrained_DOF_ids, all_DOF_ids):
@@ -500,61 +632,54 @@ def forward_problem(inputs, output_data, free_DOF_ids, constrained_DOF_ids, all_
 
 
 key = random.PRNGKey(0)
+
 N = 300
 
+# with open(data_path, "rb") as f:
+#     results_dict = pickle.load(f)
+# print("loaded data from : ", data_path)
+
+# input_data = results_dict['input_data']
+# output_data = results_dict['output_data']
 
 measure_idx = jnp.array(args.measure_idx)
 n_measure = measure_idx.shape[0]
 
-filename = f"012326_circular_structure_dataset_n_source_8_exp_param_free_set_4.pickle"
-angle_cut = 360. / geometry.n_piece
-def map_func(output_data_single):
-    output_data_temp = jnp.zeros( (n_timepoints, 2*n_excited_blocks) ) # (ts, boundary blocks * 2)
-    for i in range(n_excited_blocks):
-        normal_angle = (+180 - angle_cut/2. - angle_cut * i) * jnp.pi / 180.
-        output_data_temp = output_data_temp.at[:,i].set( output_data_single[:,i] * jnp.cos(normal_angle) )
-        output_data_temp = output_data_temp.at[:,n_excited_blocks+i].set( output_data_single[:,i] * jnp.sin(normal_angle) )
-    return output_data_temp
-
-if len(measure_idx) == 1:
-    print("Checking for data file at:", filename)
-    with open(filename, "rb") as f:
+if n_measure == 1:
+    with open(f"122525_circular_structure_dataset_n1_blocks_{n1_blocks}_n2_blocks_{n2_blocks}_n_source_8_multi.pickle", "rb") as f:
         data_dict = pickle.load(f)
-
-    print("input data shape : ", data_dict["input_data"].shape)
-    input_data = jnp.zeros_like(data_dict["input_data"][:,:,2,measure_idx,:].squeeze()) # (N, time_steps, 3)
-    input_data = input_data.at[:,:,0:2].set(data_dict["input_data"][:,:,2,measure_idx,0:2].squeeze()) # (N, time_steps, 2)
-    input_data = input_data.at[:,:,2].set(data_dict["input_data"][:,:,1,measure_idx,2].squeeze()) # (N, time_steps, 2)
+    input_data = data_dict["input_data"]
     output_data = data_dict["output_data"]
-    output_data_all = vmap(map_func)(output_data)
 else:
-    filename = f"012326_circular_structure_dataset_n_source_8_exp_param_free_set_4_idx_{measure_idx_tag}.pickle"
+    # Data load ----------------------------------------------------------------
+    # Check if file exists, if it does, read the data; otherwise, generate input data
+    filename = f"Simulation/circular_structure_dataset_n_source_8_measure_idx_{measure_idx_tag}.pickle"
+    print("Checking for data file at:", filename)
+
     if os.path.exists(filename):
         print("Loading data from file...")
         with open(filename, "rb") as f:
             data_dict = pickle.load(f)
             input_data = data_dict["input_data"]
-            output_data_all = vmap(map_func)(data_dict["output_data"])
+            output_data = data_dict["output_data"]
         print("Data loaded from file.")
-        nest_forward_problem = lambda inputs : vmap(forward_problem, in_axes=(None,0,None,None,None))(inputs, output_data_all, free_DOF_ids, constrained_DOF_ids, all_DOF_ids)
+        nest_forward_problem = lambda inputs : vmap(forward_problem, in_axes=(None,0,None,None,None))(inputs, output_data, free_DOF_ids, constrained_DOF_ids, all_DOF_ids)
     else:
-        print(f"{filename} file not found. Generating data and saving to file...")
         print("Generating data and saving to file...")
-
-        data_path = f"012326_circular_structure_dataset_n_source_8_exp_param_free_set_4.pickle"
+        data_path = "Simulation/input_source_4_training_dataset.pkl"
         with open(data_path, "rb") as f:
             data_dict = pickle.load(f)
-            output_data = data_dict["output_data"]
-
-        output_data_all = vmap(map_func)(output_data) # force function set
-        print("output data shape : ", output_data_all.shape)
-        nest_forward_problem = lambda inputs : vmap(forward_problem, in_axes=(None,0,None,None,None))(inputs, output_data_all, free_DOF_ids, constrained_DOF_ids, all_DOF_ids)
+        output_data = data_dict["output_data"] # force function set
+        print("output data shape : ", output_data.shape)
+        nest_forward_problem = lambda inputs : vmap(forward_problem, in_axes=(None,0,None,None,None))(inputs, output_data, free_DOF_ids, constrained_DOF_ids, all_DOF_ids)
         input_data = nest_forward_problem((horizontal_shifts, vertical_shifts))
         print("Input data shape:", input_data.shape)
         data_dict = {"input_data": input_data, "output_data": output_data} # input data shape (N, time_steps, 2*3)
-        with open(filename, "xb") as f:
+        with open(filename, "wb") as f:
             pickle.dump(data_dict, f)
         print("Data generated and saved to file.")
+
+#--------------------------------
 
 
 test_N = input_data.shape[0] // 10 # 10 % of total data will be used as test data
@@ -575,11 +700,12 @@ mm_scaler = minmax_scaler(training_input_data, training_output_data)
 train_data_normalized, train_output_normalized = mm_scaler.transform(training_input_data, training_output_data)
 test_data_normalized, test_output_normalized = mm_scaler.transform(test_input_data, test_output_data)
 
-model = TimeSeriesCNN(output_features=n_piece)
+model = TimeSeriesCNN(output_features=n_source)
 init_params = model.init(key, input_data)
 preds = model.apply(init_params, input_data)
 
 def inner_loss(params, outer_parameters, data):
+  
   inputs, targets = data
   predictions = model.apply(params, inputs)
   mse = jnp.mean((predictions - targets)**2)  # this is L(phi_prime, D^{tr}_i)
@@ -600,7 +726,7 @@ inner_solver = OptaxSolver(opt=optax.adam(args.innerlr),
 
 hori_shifts_length = (n1_blocks+1) * n2_blocks * 2
 
-nest_forward_problem = lambda inputs : vmap(forward_problem, in_axes=(None,0,None,None,None))(inputs, output_data_all, free_DOF_ids, constrained_DOF_ids, all_DOF_ids)
+nest_forward_problem = lambda inputs : vmap(forward_problem, in_axes=(None,0,None,None,None))(inputs, output_data, free_DOF_ids, constrained_DOF_ids, all_DOF_ids)
 def outer_loss(meta_params):
 
     horizontal_shifts = meta_params[:hori_shifts_length].reshape((n1_blocks+1, n2_blocks, 2))
@@ -614,8 +740,10 @@ def outer_loss(meta_params):
     test_output_data = output_data[test_idx]
     train_data_normalized, train_output_normalized = mm_scaler.transform(training_input_data, training_output_data)
     test_data_normalized, test_output_normalized = mm_scaler.transform(test_input_data, test_output_data)
+    # iter_data = dataloader((train_data_normalized, train_output_normalized), batch_size)
+    # test_data = (test_data_normalized, test_output_normalized)
 
-    model = TimeSeriesCNN(output_features=n_piece)
+    model = TimeSeriesCNN(output_features=n_source)
     nn_params = model.init(key, input_data)
 
     in_params_sol, state = inner_solver.run(
@@ -624,14 +752,22 @@ def outer_loss(meta_params):
         (train_data_normalized, train_output_normalized)
         ) 
 
+    # prediction = vmap(model.forward)(in_params_sol, samples_test)
     prediction = model.apply(in_params_sol, test_data_normalized)
     loss = jnp.mean((prediction - test_output_normalized)**2)  # L(\phi, D^{te}_i)
 
+    # return loss, (in_params_sol, state, train_data_normalized, train_output_normalized, test_data_normalized, test_output_normalized)
     return loss, (in_params_sol, state, training_input_data, training_output_data, test_input_data, test_output_data)
-    # return loss, (in_params_sol, state)
+
+# print( "loading previous results..." )
+# with open(f"01052026_circular_structure_cooptimization_n_source_16_measure_idx_48_multi.pickle", "rb") as f:
+#     record_dict = pickle.load(f)
+
+# param_record = record_dict["design_record"]
 
 # horizontal_shifts, vertical_shifts = inputs
 meta_params = jnp.concatenate( (horizontal_shifts.flatten(), vertical_shifts.flatten()))
+# meta_params = param_record[-1]
 print("meta params shape : ", meta_params.shape)
 
 solver = OptaxSolver(
@@ -667,7 +803,7 @@ for it in pbar:
                     "nn_record": in_param_record,
                     "loss_record": outer_losses}
 
-    with open(time_string+f"_circular_robot_cooptimization_n_source_{n_source}_measure_idx_{measure_idx_tag}.pickle", "wb") as f:
+    with open(time_string+f"_circular_structure_cooptimization_n_source_{n_source}_measure_idx_{measure_idx_tag}_multi.pickle", "wb") as f:
         pickle.dump(record_dict, f)
 
 print("time : ", time.time()-start_time)
