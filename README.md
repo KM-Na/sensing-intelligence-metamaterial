@@ -4,10 +4,7 @@ This repository is a modular walkthrough of the sensing/co-optimization
 pipeline behind the paper: forward simulation of each structure type, a
 neural-network readout trained on that simulation data, a comparison of
 readout performance before vs. after design optimization, and an
-illustration of how the design gradient itself is computed. It does not
-include the real production co-optimization scripts, the large private
-training datasets those require, or experimental-force results — see
-"What's not included" below.
+illustration of how the design gradient itself is computed.
 
 ## Contents
 
@@ -91,18 +88,6 @@ python scripts/train_neural_network.py --structure circular_structure
 
 Every notebook and script here runs out of the box using the bundled
 `data/*.npz` files — no private data required.
-
-## What's not included
-
-The real bilevel co-optimization scripts and the large private training
-datasets they need are intentionally not part of this distribution.
-`gradient_computation_demo.ipynb` shows the same underlying mechanism at toy
-scale instead. Experimental-force results and the notebook comparing them
-are also intentionally excluded; only the simulated Gaussian-impulse case is
-published here. The scripts that regenerate `data/*.npz` from the original
-private research folder are excluded too, since they require access to that
-folder and aren't runnable without it — everything published here works from
-the bundled `data/*.npz` files directly.
 
 ## Sanity-Check Scripts
 
