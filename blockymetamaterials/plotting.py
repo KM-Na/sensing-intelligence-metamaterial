@@ -224,7 +224,7 @@ def prepare_solution_figure(data: SolutionData, field, frame_range, figsize, cma
         _legend_label = r"$\dot{u}$"
     elif field == "theta_abs":
         field_values = np.abs(data.fields[:, 0, :, 2])
-        _legend_label = r"$\lvert\theta\rvert$"
+        _legend_label = r"$|\theta|$"
     elif type(field) == str and field_values is not None:
         _legend_label = field
     else:
@@ -269,7 +269,7 @@ def prepare_mode_figure(data: EigenmodeData, field, mode_range, figsize, cmap=or
         _legend_label = r"$u$"
     elif field == "theta_abs":
         field_values = np.abs(data.fields[:, :, 2])
-        _legend_label = r"$\lvert\theta\rvert$"
+        _legend_label = r"$|\theta|$"
     else:
         raise ValueError
 

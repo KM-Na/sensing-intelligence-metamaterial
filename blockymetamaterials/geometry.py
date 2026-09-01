@@ -2012,6 +2012,797 @@ class QuadGeometry_Circle_Input(LatticeGeometry):
         return horizontal_shifts, vertical_shifts
     
 
+class QuadGeometry_Circle_InputSource_vis(LatticeGeometry):
+    """
+    Aperiodic lattice made of quadrangles with finite-length bonds.
+    """
+
+    def __init__(self, n1_blocks: int, n2_blocks: int, spacing: float = 1.0, bond_length: float = 0.1, n_piece=8, n_outer=4):
+        """
+        Creates a non-periodic lattice made of quadrangles with finite-length bonds.
+        """
+
+        super().__init__(n1_cells=n1_blocks, n2_cells=n2_blocks, n_bpc=1, direct_basis=spacing * jnp.eye(2))
+        self.spacing = spacing
+        self.bond_length = bond_length
+        self.n1_blocks = self.n1_cells
+        self.n2_blocks = self.n2_cells
+        self.n_npb = 4
+        self.n_quads = self.n_blocks  # quadrilateral blocks from LatticeGeometry
+        self.n_piece = n_piece
+        self.n_quads_org = self.n_blocks
+        self.n_outer = n_outer
+
+        # Shell blocks: one per interval (n_piece total)
+        # Node counts will be determined dynamically based on connection vertices
+        self.n_shell_blocks = n_piece
+        self.shell_node_counts = []  # Will be set in compute_geometry
+
+        # Total blocks: quads (only inside blocks) + shell blocks
+        # Note: boundary quads are replaced by shell blocks
+        self.block_node_counts_list = []  # Will be set in compute_geometry
+        # self.n_blocks_total = 0  # Will be set in compute_geometry
+        self.n_nodes_total = 0  # Will be set in compute_geometry
+        self.block_node_counts = None  # Will be set in compute_geometry
+
+        self.block_centroids: Callable
+        self.centroid_node_vectors: Callable
+        self.bond_connectivity: Callable
+        self.reference_bond_vectors: Callable
+
+    def _shell_vertices_from_connections(self, connection_vertices: jnp.ndarray, interval_vertices: jnp.ndarray, order: int):
+        """
+        Build shell polygon with zigzag inner edge and smooth outer edge.
+        Connection vertices are where inner blocks connect to the shell.
+        Interval vertices are added between connection vertices for zigzag inner edge.
+        Outer edge is smooth with up to 3 additional vertices for circular shape.
+
+        Args:
+            connection_vertices: (n_conn, 2) vertices on inner blocks for connection
+            interval_vertices: (n_interval, 2) vertices between connection vertices (zigzag inner edge)
+
+        Returns:
+            verts: (n_conn + n_interval + n_outer, 2) shell vertices ordered counter-clockwise
+            connection_indices: (n_conn,) indices of connection vertices in verts
+        """
+        n_conn = connection_vertices.shape[0]
+        n_interval = interval_vertices.shape[0] # n_interval = n_conn-1
+
+        if n_conn == 0:
+                # Fallback: create minimal shell
+            return jnp.zeros((3, 2)), jnp.array([], dtype=int)
+
+        # Order connection vertices by angle around center
+        # center = jnp.mean(connection_vertices, axis=0)
+        center = self._center
+        conn_dist_vec = connection_vertices - center
+        conn_angles = jnp.atan2(conn_dist_vec[:, 1], conn_dist_vec[:, 0])
+
+        # Add the exception treatment
+
+        # conn_sorted_idx = jnp.argsort(conn_angles)
+        # conn_sorted = connection_vertices[conn_sorted_idx]
+        conn_sorted = connection_vertices # keep the order
+        conn_sorted_idx = jnp.arange(len(connection_vertices))
+
+        # Build inner edge: connection vertices + interval vertices (zigzag pattern)
+        # Interleave interval vertices between connection vertices
+        inner_edge_verts = []
+        conn_indices_inner = []
+
+        # Match interval vertices to connection pairs
+        # Interval vertices are created between consecutive connection vertices
+        count = 0 # vertices are aligned in counter-clockwise direction
+        for i in range(n_conn):
+            # Add connection vertex
+            inner_edge_verts.append(conn_sorted[i]) # conned_sort
+            conn_indices_inner.append(count)
+            count += 1
+            # Add corresponding interval vertex after this connection vertex
+            # Interval vertices are ordered to match connection pairs
+            if n_interval > 0 and i < n_interval:
+                inner_edge_verts.append(interval_vertices[i])
+                count += 1
+
+        inner_edge_verts = jnp.array(inner_edge_verts)
+
+        # Build smooth outer edge with up to 3 additional vertices
+        # Compute average radius of inner edge
+        inner_radius = 0.5 * self.n1_blocks * self.spacing * 0.8
+        outer_radius = inner_radius + 0.6 * self.n1_blocks * self.spacing / 15. # 16.125
+        # outer_radius = inner_radius + self.spacing # 16.125
+
+        # Create outer edge vertices (smooth, circular)
+        # Use up to 4 vertices to approximate a smooth circular arc
+        # n_outer = min(3, max(1, n_conn // 2))  # Up to 3 outer vertices, at least 1 if we have connections
+        n_outer = self.n_outer
+        outer_edge_verts = []
+        angle_cut = 2. * jnp.pi / self.n_piece
+        # desired_angle = angle_cut - 5.0 * jnp.pi / 180. # angle of arc
+        buffer_angle = 5.0 * jnp.pi / 180.
+        desired_angle = angle_cut - buffer_angle
+
+
+        if n_outer > 0 and n_conn > 0:
+            # Compute angles for outer vertices (distributed along the arc)
+            # first_angle = conn_angles[conn_sorted_idx[-1]]
+            # last_angle = conn_angles[conn_sorted_idx[0]]
+            first_angle = - angle_cut * (order+1) + jnp.pi + buffer_angle / 2. + self._bias
+            last_angle = - angle_cut * order + jnp.pi - buffer_angle /2. + self._bias
+            # Handle wrap-around: if the arc crosses -π/π boundary
+            last_angle = jnp.where( last_angle < first_angle, last_angle+2*jnp.pi, last_angle)
+            # if last_angle < first_angle:
+            #     last_angle += 2 * jnp.pi
+            # first_angle = (first_angle+last_angle)/2.0 - desired_angle/2.0
+            # last_angle = first_angle + desired_angle
+
+            # Create outer vertices along smooth circular arc
+            for i in range(n_outer):
+                # Distribute angles evenly between first and last connection
+                t = (i) / (n_outer-1)
+                angle = first_angle + t * desired_angle
+                # angle = last_angle + t * (first_angle - last_angle) # start from last point to first point
+                # Use angle directly (already in correct range after wrap-around handling)
+                if i == 0 :
+                    outer_vert = center + inner_radius * jnp.array([jnp.cos(angle), jnp.sin(angle)])
+                    outer_edge_verts.append(outer_vert)
+
+                outer_vert = center + outer_radius * jnp.array([jnp.cos(angle), jnp.sin(angle)])
+                outer_edge_verts.append(outer_vert) # total number of vertices of outer verts is n_outer+2
+
+                if i == n_outer-1:
+                    outer_vert = center + inner_radius * jnp.array([jnp.cos(angle), jnp.sin(angle)])
+                    outer_edge_verts.append(outer_vert)
+
+        outer_edge_verts = jnp.array(outer_edge_verts) if len(outer_edge_verts) > 0 else jnp.zeros((0, 2))
+
+        # Build complete shell: inner edge (zigzag) -> outer edge (smooth)
+        # The polygon goes: connection vertices and interval vertices (zigzag inner edge),
+        # then outer vertices (smooth outer edge), forming a closed polygon
+        shell_verts = jnp.vstack([inner_edge_verts, outer_edge_verts])
+
+        # Map connection indices to final shell vertex indices
+        connection_indices = jnp.array(conn_indices_inner, dtype=int)
+
+        return shell_verts, connection_indices
+
+    def compute_geometry(self):
+        """
+        Implements mappings between (`horizontal_shift`, `vertical_shift`) and `centroid_node_vectors`, `bond_connectivity`, `reference_bond_vectors`.
+        """
+
+        def reference_node_vectors(horizontal_shift: jnp.ndarray, vertical_shift: jnp.ndarray):
+            """Computes vectors connecting the reference point (square grid) of the block to each node.
+
+            Args:
+                horizontal_shift (jnp.ndarray): array of shape (n1_cells+1, n2_cells, 2) defining the shifts of the horizontally aligned nodes.
+                vertical_shift (jnp.ndarray): array of shape (n1_cells, n2_cells+1, 2) defining the shifts of the vertically aligned nodes.
+            """
+
+            v0 = (self.spacing - self.bond_length) / 2 * jnp.array([1., 0.])
+            v0s = vmap(lambda angle: jnp.dot(rotation_matrix(angle), v0))(jnp.linspace(0., 3 * jnp.pi / 2, 4))
+
+            def _reference_node_vectors_block(n1_block, n2_block):
+                return v0s + jnp.array([
+                    horizontal_shift[n1_block+1, n2_block],
+                    vertical_shift[n1_block, n2_block+1],
+                    horizontal_shift[n1_block, n2_block],
+                    vertical_shift[n1_block, n2_block],
+                ])
+
+            n1s, n2s = jnp.meshgrid(jnp.arange(self.n1_blocks), jnp.arange(self.n2_blocks))
+            n1s, n2s = n1s.reshape((self.n_quads_org,)), n2s.reshape((self.n_quads_org,))
+
+            return vmap(_reference_node_vectors_block, in_axes=(0, 0))(n1s, n2s)
+
+        def quad_reference_points():
+            """Computes reference points of the quad blocks."""
+            n1s, n2s = jnp.meshgrid(jnp.arange(self.n1_blocks), jnp.arange(self.n2_blocks))
+            n1s, n2s = n1s.reshape((self.n_quads_org,)), n2s.reshape((self.n_quads_org,))
+            return vmap(lambda i, j: i * self.direct_basis[0] + j * self.direct_basis[1], in_axes=(0, 0))(n1s, n2s)
+
+        def quad_centroids(horizontal_shift: jnp.ndarray, vertical_shift: jnp.ndarray):
+            """Computes quad blocks' centroids."""
+            reference_vectors = reference_node_vectors(horizontal_shift, vertical_shift)
+            centroid_shifts = vmap(polygon_centroid)(reference_vectors)
+            return quad_reference_points() + centroid_shifts
+
+        def quad_centroid_node_vectors(horizontal_shift: jnp.ndarray, vertical_shift: jnp.ndarray):
+            """Computes vectors connecting quad block centroids to nodes."""
+            reference_vectors = reference_node_vectors(horizontal_shift, vertical_shift)
+            centroid_shifts = vmap(polygon_centroid)(reference_vectors)
+            return vmap(lambda block_nodes, shift: block_nodes - shift, in_axes=(0, 0))(reference_vectors, centroid_shifts)
+
+        # --- Setup bond connectivity for finding boundaries ---
+        horizontal_bonds = jnp.array([
+            [self.n1_blocks * n2 * 4 + n1 * 4, self.n1_blocks * n2 * 4 + (n1 + 1) * 4 + 2]
+            for n2 in range(self.n2_blocks) for n1 in range(self.n1_blocks - 1)
+        ])
+        vertical_bonds = jnp.array([
+            [self.n1_blocks * n2 * 4 + n1 * 4 + 1, self.n1_blocks * (n2 + 1) * 4 + n1 * 4 + 1 + 2]
+            for n2 in range(self.n2_blocks - 1) for n1 in range(self.n1_blocks)
+        ])
+        _bond_connectivity = jnp.concatenate([horizontal_bonds, vertical_bonds], axis=0)
+        self._bond_connectivity = _bond_connectivity
+
+        # bond connecting between boundary blocks / n_piece will be variable later
+        angle_cut = 360.0 / self.n_piece
+
+        # --- Compute block centroids for reference configuration ---
+        h_shift = jnp.zeros((self.n1_blocks + 1, self.n2_blocks, 2))
+        v_shift = jnp.zeros((self.n1_blocks, self.n2_blocks + 1, 2))
+        centroids = quad_centroids(h_shift, v_shift)
+        quad_rel = quad_centroid_node_vectors(h_shift, v_shift)
+        # --- Circle definition ---
+        center = jnp.mean(centroids, axis=0)
+        radius = 0.5 * self.n1_blocks * self.spacing * 0.8  # 90% of grid half-width
+        tol = self.spacing * 0.5  # boundary tolerance: about half a block spacing
+
+        dist_vec = centroids - center
+        # --- Classify blocks ---
+        dist = jnp.linalg.norm(dist_vec, axis=1)
+        inside_mask = dist < (radius - tol)
+        blocks_inside = jnp.where(inside_mask)[0]
+        _bond_connectivity_idx = _bond_connectivity // 4 # block indices that are connected
+        connection = jnp.isin(_bond_connectivity_idx, blocks_inside)
+        check_connection = jnp.sum( connection, axis=1)
+
+        boundary = _bond_connectivity_idx[check_connection==1] # blocks that have connection with blocks inside
+        connection_boundary = connection[check_connection==1]
+        blocks_boundary = jnp.unique( boundary[~connection_boundary] )
+
+        dist_vec_bound = dist_vec[blocks_boundary]
+        angle_bound = jnp.atan2( dist_vec_bound[:,1], dist_vec_bound[:,0] ) * 180./jnp.pi
+        bond_boundary_and_outside = _bond_connectivity_idx[check_connection == 0]
+
+        boundary_separation = []
+        for count in range(self.n_piece):
+
+            ang_max = - angle_cut * count + 180.
+            ang_min = - angle_cut * (count+1) + 180.
+
+            mask_angle = jnp.logical_and( angle_bound > ang_min, angle_bound <= ang_max )
+            bound_blocks = blocks_boundary[mask_angle] # boundary blocks corresponding the angle interval
+            # check bonds that are connected to boundary blocks
+            bond_partial = bond_boundary_and_outside[jnp.sum( jnp.isin(bond_boundary_and_outside, bound_blocks), axis=1) > 0]
+
+            bridge_block = []
+
+            if len(bridge_block) == 0:
+                boundary_separation.append( bound_blocks )
+            else:
+                boundary_separation.append( jnp.concatenate( ( bound_blocks, jnp.array(bridge_block) ) ) )
+
+        blocks_boundary = jnp.concatenate( boundary_separation )
+        blocks_outside = jnp.arange( self.n1_blocks * self.n2_blocks )
+        blocks_outside = jnp.delete( blocks_outside, jnp.concatenate( (blocks_inside, blocks_boundary) ) )
+        self._center = center
+        self._bias = 0.0
+        self.blocks_inside = blocks_inside
+        self.blocks_boundary = blocks_boundary
+        self.blocks_outside = blocks_outside
+        self.boundary_separation = boundary_separation
+
+
+        # --- Find connection vertices and create shell blocks ---
+        # Compute node positions (centroid + relative)
+        def get_node_pos(block_idx, node_idx):
+            return centroids[block_idx] + quad_rel[block_idx, node_idx]
+
+        # For each interval, find connection vertices and interval vertices
+        shell_connection_info = []  # List of (connection_vertices, interval_vertices, connection_node_info, conn_indices)
+        shell_node_counts_list = []
+
+        for count in range(self.n_piece):
+            bound_blocks = boundary_separation[count]
+
+            # Find bonds between inner blocks and boundary blocks in this interval
+            bonds_inner_to_boundary = []
+            # Vectorized version using jnp functionality
+            # Compute block indices and node indices for each bond
+            b0 = _bond_connectivity[:, 0] // 4
+            b1 = _bond_connectivity[:, 1] // 4
+            node0 = _bond_connectivity[:, 0] % 4
+            node1 = _bond_connectivity[:, 1] % 4
+            # Determine mask for which bonds connect inner to boundary, either direction
+            mask0 = jnp.logical_and(
+                jnp.isin(b0, blocks_inside),
+                jnp.isin(b1, bound_blocks)
+            )
+            mask1 = jnp.logical_and(
+                jnp.isin(b1, blocks_inside),
+                jnp.isin(b0, bound_blocks)
+            )
+            # Get indices of matches for both cases
+            idx0 = jnp.where(mask0)[0]
+            idx1 = jnp.where(mask1)[0]
+
+            # For mask0: (b0 in inside, b1 in boundary)
+            bonds0 = jnp.stack([b0[idx0], node0[idx0], b1[idx0], node1[idx0]], axis=1)
+
+            # For mask1: (b1 in inside, b0 in boundary) (order reversed)
+            bonds1 = jnp.stack([b1[idx1], node1[idx1], b0[idx1], node0[idx1]], axis=1)
+
+            # Combine, convert to list of tuples for expected format
+            bonds_inner_to_boundary = [tuple(x) for x in jnp.concatenate([bonds0, bonds1], axis=0)] # axis 0 blocks inside, axis 3 blocks boundary
+
+            # Get connection vertices (on inner blocks)
+            connection_vertices = []
+            connection_node_info = []  # (block_idx, node_idx) for each connection
+            for b_inner, n_inner, b_bound, n_bound in bonds_inner_to_boundary:
+                conn_vert = get_node_pos(b_bound, n_bound)
+                connection_vertices.append(conn_vert)
+                connection_node_info.append((b_bound, n_bound, b_inner, n_inner))
+
+            connection_vertices = jnp.array(connection_vertices) if len(connection_vertices) > 0 else jnp.zeros((0, 2))
+
+            # Generate interval vertices between connection vertices for zigzag inner edge
+            # Note: interval_vertices will be created based on sorted connection vertices
+            # The _shell_vertices_from_connections method will sort connection_vertices again,
+            # so we create interval_vertices here but they'll be properly matched in that method
+            interval_vertices = []
+            if connection_vertices.shape[0] > 1:
+                # Order connection vertices by angle around center (same as in _shell_vertices_from_connections)
+                conn_dist_vec = connection_vertices - center
+                conn_angles = jnp.atan2(conn_dist_vec[:, 1], conn_dist_vec[:, 0])
+                conn_sorted_idx = jnp.argsort(conn_angles, descending=True)
+                conn_sorted = connection_vertices[conn_sorted_idx]
+                connection_node_info = jnp.array(connection_node_info)[conn_sorted_idx]
+
+
+                # Create interval vertices between consecutive connection vertices
+                # These create the zigzag pattern on the inner edge
+                def compute_interval_vert(curr_conn, next_conn):
+                    mid_point = 0.5 * (curr_conn + next_conn)
+                    direction = next_conn - curr_conn
+                    perp_dir = jnp.array([-direction[1], direction[0]])
+                    perp_dir = perp_dir / (jnp.linalg.norm(perp_dir) + 1e-8)
+                    zigzag_offset = self.spacing * 0.3
+                    zigzag_sign = 1
+                    return mid_point + zigzag_sign * zigzag_offset * perp_dir
+
+                # We want intervals between consecutive pairs: (conn_sorted[0], conn_sorted[1]), ...
+                if conn_sorted.shape[0] > 1:
+                    curr_conns = conn_sorted[:-1]
+                    next_conns = conn_sorted[1:]
+                    interval_vertices = vmap(compute_interval_vert)(curr_conns, next_conns)
+                    # interval_vertices = [v for v in interval_vertices]
+
+                # Store interval_vertices in the same sorted order as connection_vertices
+                # (They're already in the correct order since we created them based on sorted connections)
+
+            interval_vertices = interval_vertices if len(interval_vertices) > 0 else jnp.zeros((0, 2))
+
+            # Create shell vertices
+            if connection_vertices.shape[0] > 0 or interval_vertices.shape[0] > 0:
+
+                if count == 0:
+                    conn_dist_vec = conn_sorted - center
+                    conn_angles = jnp.atan2(conn_dist_vec[:, 1], conn_dist_vec[:, 0])
+                    first_angle = conn_angles[-1]
+                    last_angle =  conn_angles[0] # should be larger than first_angle
+
+                    last_angle = jnp.where( last_angle < first_angle, last_angle+2*jnp.pi, last_angle)
+                    mid_angle = ( first_angle + last_angle )/2.
+                    mid_angle_hard = - 0.5 * angle_cut * jnp.pi / 180. + jnp.pi
+                    self._bias =  mid_angle - mid_angle_hard # update bias
+                    print( "bias : ", self._bias * 180./jnp.pi)
+
+                shell_verts, conn_indices = self._shell_vertices_from_connections(conn_sorted, interval_vertices, order=count)
+                n_shell_verts = shell_verts.shape[0]
+            else:
+                # Fallback: create minimal shell
+                shell_verts = jnp.zeros((3, 2))
+                conn_sorted = connection_vertices
+                conn_indices = jnp.array([], dtype=int)
+                n_shell_verts = 4
+
+            shell_connection_info.append((shell_verts, conn_sorted, interval_vertices, connection_node_info, conn_indices))
+            shell_node_counts_list.append(n_shell_verts)
+
+        self.shell_node_counts = shell_node_counts_list
+        self.shell_connection_info = shell_connection_info
+
+        # Update block node counts
+        self.block_node_counts_list = [4] * len(blocks_inside) + shell_node_counts_list
+        self.n_blocks = len(blocks_inside) + self.n_shell_blocks
+        self.n_nodes_total = sum(self.block_node_counts_list)
+        self.block_node_counts = jnp.array(self.block_node_counts_list, dtype=int)
+        self.n_quads = len(blocks_inside)
+
+
+
+        # --- Define geometry functions that include shell blocks ---
+        def block_centroids(horizontal_shift: jnp.ndarray, vertical_shift: jnp.ndarray):
+            """Computes blocks' centroids including shell blocks. Returns tuple."""
+
+            quad_cents = quad_centroids(horizontal_shift, vertical_shift)
+            quad_rel = quad_centroid_node_vectors(horizontal_shift, vertical_shift)
+
+            # Get centroids for inner quads only
+            # inner_centroids = [quad_cents[i] for i in blocks_inside]
+            inner_centroids = quad_cents[self.blocks_inside]
+
+            def get_node_pos(block_idx, node_idx):
+                return quad_cents[block_idx] + quad_rel[block_idx, node_idx]
+            # Compute shell block centroids
+            shell_centroids = []
+            shell_connection_info = []
+            for count in range(self.n_piece):
+                conn_info = self.shell_connection_info[count]
+                connection_vertices = conn_info[1]
+                interval_vertices = conn_info[2]
+                connection_node_info = conn_info[3]
+                conn_indices = conn_info[4]
+
+                # # Recompute shell vertices for current configuration
+                if connection_vertices.shape[0] > 0 or interval_vertices.shape[0] > 0:
+                    b_bound, n_bound = connection_node_info[:,0], connection_node_info[:,1]
+
+                    updated_conn_verts = vmap(get_node_pos, in_axes=(0,0))(b_bound, n_bound)
+                    # conn_dist_vec = connection_vertices - self._center
+                    # Create interval vertices between consecutive connection vertices
+                    # These create the zigzag pattern on the inner edge
+                    def compute_interval_vert(curr_conn, next_conn):
+                        mid_point = 0.5 * (curr_conn + next_conn)
+                        direction = next_conn - curr_conn
+                        perp_dir = jnp.array([-direction[1], direction[0]])
+                        perp_dir = perp_dir / (jnp.linalg.norm(perp_dir) + 1e-8)
+                        zigzag_offset = self.spacing * 0.3
+                        zigzag_sign = 1
+                        return mid_point + zigzag_sign * zigzag_offset * perp_dir
+                    # We want intervals between consecutive pairs: (conn_sorted[0], conn_sorted[1]), ...
+                    curr_conns = updated_conn_verts[:-1]
+                    next_conns = updated_conn_verts[1:]
+                    interval_vertices = vmap(compute_interval_vert)(curr_conns, next_conns) # updated interval_vertices
+
+                    # For interval vertices, we need to recompute from boundary blocks
+                    # For now, use the reference positions
+                    shell_verts, _ = self._shell_vertices_from_connections(updated_conn_verts, interval_vertices, order=count)
+                    shell_centroid = polygon_centroid(shell_verts)
+                else:
+                    # shell_verts = jnp.zeros((0, 2))
+                    # updated_conn_verts = connection_vertices
+                    shell_centroid = jnp.array([0., 0.])
+
+                shell_centroids.append(shell_centroid)
+            #     shell_connection_info.append((shell_verts, updated_conn_verts, interval_vertices, connection_node_info, conn_indices))
+            # self.shell_connection_info = shell_connection_info
+            # Return as tuple
+            return tuple(inner_centroids) + tuple(shell_centroids)
+
+        def centroid_node_vectors(horizontal_shift: jnp.ndarray, vertical_shift: jnp.ndarray):
+            """Computes vectors connecting block centroids to nodes. Returns tuple."""
+            quad_cents = quad_centroids(horizontal_shift, vertical_shift)
+            quad_rel = quad_centroid_node_vectors(horizontal_shift, vertical_shift)
+
+            # Get node vectors for inner quads only
+            # inner_node_vectors = [quad_rel[i] for i in blocks_inside]
+            inner_node_vectors = quad_rel[self.blocks_inside]
+
+            def get_node_pos(block_idx, node_idx):
+                return quad_cents[block_idx] + quad_rel[block_idx, node_idx]
+
+            # Compute shell block node vectors
+            shell_node_vectors = []
+            shell_connection_info = []
+            for count in range(self.n_piece):
+                conn_info = self.shell_connection_info[count]
+                connection_vertices = conn_info[1]
+                interval_vertices = conn_info[2]
+                connection_node_info = conn_info[3]
+                conn_indices = conn_info[4]
+
+                # # Recompute shell vertices for current configuration
+                if connection_vertices.shape[0] > 0 or interval_vertices.shape[0] > 0:
+                    b_bound, n_bound = connection_node_info[:,0], connection_node_info[:,1]
+                    updated_conn_verts = vmap(get_node_pos, in_axes=(0,0))(b_bound, n_bound)
+                    # conn_dist_vec = connection_vertices - self._center
+                    # Create interval vertices between consecutive connection vertices
+                    # These create the zigzag pattern on the inner edge
+                    def compute_interval_vert(curr_conn, next_conn):
+                        mid_point = 0.5 * (curr_conn + next_conn)
+                        direction = next_conn - curr_conn
+                        perp_dir = jnp.array([-direction[1], direction[0]])
+                        perp_dir = perp_dir / (jnp.linalg.norm(perp_dir) + 1e-8)
+                        zigzag_offset = self.spacing * 0.3
+                        zigzag_sign = 1
+                        return mid_point + zigzag_sign * zigzag_offset * perp_dir
+                    # We want intervals between consecutive pairs: (conn_sorted[0], conn_sorted[1]), ...
+                    curr_conns = updated_conn_verts[:-1]
+                    next_conns = updated_conn_verts[1:]
+                    interval_vertices = vmap(compute_interval_vert)(curr_conns, next_conns) # updated interval_vertices
+
+                    # For interval vertices, we need to recompute from boundary blocks
+                    # For now, use the reference positions
+                    shell_verts, _ = self._shell_vertices_from_connections(updated_conn_verts, interval_vertices, order=count)
+                    shell_centroid = polygon_centroid(shell_verts)
+                    shell_rel = shell_verts - shell_centroid
+                else:
+                    # shell_verts = jnp.zeros((0, 2))
+                    # updated_conn_verts = connection_vertices
+                    shell_rel = jnp.zeros((3, 2))
+
+                shell_node_vectors.append(shell_rel)
+
+            #     shell_connection_info.append((shell_verts, updated_conn_verts, interval_vertices, connection_node_info, conn_indices))
+            # self.shell_connection_info = shell_connection_info
+            return tuple(inner_node_vectors) + tuple(shell_node_vectors)
+
+
+        def block_centroids_node(horizontal_shift: jnp.ndarray, vertical_shift: jnp.ndarray):
+            """Computes vectors connecting block centroids to nodes. Returns tuple."""
+            quad_cents = quad_centroids(horizontal_shift, vertical_shift)
+            quad_rel = quad_centroid_node_vectors(horizontal_shift, vertical_shift)
+
+            # Get node vectors for inner quads only
+            # inner_node_vectors = [quad_rel[i] for i in blocks_inside]
+            inner_node_vectors = quad_rel[self.blocks_inside]
+            inner_centroids = quad_cents[self.blocks_inside]
+
+            def get_node_pos(block_idx, node_idx):
+                return quad_cents[block_idx] + quad_rel[block_idx, node_idx]
+            # Compute shell block node vectors
+            shell_node_vectors = []
+            shell_centroids = []
+            for count in range(self.n_piece):
+                conn_info = self.shell_connection_info[count]
+                connection_vertices = conn_info[1]
+                interval_vertices = conn_info[2]
+
+                # # Recompute shell vertices for current configuration
+                if connection_vertices.shape[0] > 0 or interval_vertices.shape[0] > 0:
+                    b_bound, n_bound = connection_node_info[:,0], connection_node_info[:,1]
+                    updated_conn_verts = vmap(get_node_pos, in_axes=(0,0))(b_bound, n_bound)
+                    # conn_dist_vec = connection_vertices - self._center
+                    # Create interval vertices between consecutive connection vertices
+                    # These create the zigzag pattern on the inner edge
+                    def compute_interval_vert(curr_conn, next_conn):
+                        mid_point = 0.5 * (curr_conn + next_conn)
+                        direction = next_conn - curr_conn
+                        perp_dir = jnp.array([-direction[1], direction[0]])
+                        perp_dir = perp_dir / (jnp.linalg.norm(perp_dir) + 1e-8)
+                        zigzag_offset = self.spacing * 0.3
+                        zigzag_sign = -1
+                        return mid_point + zigzag_sign * zigzag_offset * perp_dir
+                    # We want intervals between consecutive pairs: (conn_sorted[0], conn_sorted[1]), ...
+                    curr_conns = updated_conn_verts[:-1]
+                    next_conns = updated_conn_verts[1:]
+                    interval_vertices = vmap(compute_interval_vert)(curr_conns, next_conns) # updated interval_vertices
+
+                    # For interval vertices, we need to recompute from boundary blocks
+                    # For now, use the reference positions
+                    shell_verts, _ = self._shell_vertices_from_connections(updated_conn_verts, interval_vertices, order=count)
+                    shell_centroid = polygon_centroid(shell_verts)
+                    shell_rel = shell_verts - shell_centroid
+                else:
+                    shell_rel = jnp.zeros((3, 2))
+
+                shell_node_vectors.append(shell_rel)
+                shell_centroids.append(shell_centroid)
+
+            node_vectors = tuple(inner_node_vectors) + tuple(shell_node_vectors)
+            centroids = tuple(inner_centroids) + tuple(shell_centroids)
+            # Return as tuple
+            return centroids, node_vectors
+
+        self.block_centroids_node = jit(block_centroids_node) # integrated function for blocks_centroids, centroid_node_vectors
+        self.block_centroids = jit(block_centroids)
+        self.centroid_node_vectors = jit(centroid_node_vectors)
+
+        # self.block_centroids_node = block_centroids_node # integrated function for blocks_centroids, centroid_node_vectors
+        # self.block_centroids = block_centroids
+        # self.centroid_node_vectors = centroid_node_vectors
+
+        def bond_connectivity_org():
+            """
+            Computes bonds' connectivity for a circle-shaped structure with shell blocks.
+            Connects inner blocks to shell blocks instead of boundary blocks.
+            """
+
+            # Bonds between inner blocks
+            horizontal_bonds = jnp.array([
+                [self.n1_blocks * n2 * 4 + n1 * 4, self.n1_blocks * n2 * 4 + (n1 + 1) * 4 + 2]
+                for n2 in range(self.n2_blocks) for n1 in range(self.n1_blocks - 1)
+            ])
+            vertical_bonds = jnp.array([
+                [self.n1_blocks * n2 * 4 + n1 * 4 + 1, self.n1_blocks * (n2 + 1) * 4 + n1 * 4 + 1 + 2]
+                for n2 in range(self.n2_blocks - 1) for n1 in range(self.n1_blocks)
+            ])
+            bonds = jnp.concatenate([horizontal_bonds, vertical_bonds], axis=0)
+
+            # --- Map node indices to block indices ---
+            def bond_to_block(bond):
+                return bond // 4  # 4 nodes per block
+
+            bond_blocks = vmap(bond_to_block)(bonds)
+            b0 = bond_blocks[:, 0]
+            b1 = bond_blocks[:, 1]
+
+            # --- Keep only bonds between inner blocks ---
+            b0_inside = jnp.isin(b0, self.blocks_inside)
+            b1_inside = jnp.isin(b1, self.blocks_inside)
+            keep_mask = jnp.logical_and(b0_inside, b1_inside)
+            filtered_bonds = bonds[keep_mask]
+
+            # --- Add bonds from inner blocks to shell blocks ---
+            # Compute node offsets for shell blocks
+            offset_quads = 4 * len(self.blocks_inside)
+            shell_bonds = []
+
+            for count in range(self.n_piece):
+                conn_info = self.shell_connection_info[count]
+                connection_node_info = conn_info[3]  # (block_idx, node_idx) pairs
+                conn_indices = conn_info[4]  # indices in shell block
+
+                shell_offset = offset_quads + sum(self.shell_node_counts[:count])
+
+                for (b_inner, n_inner), shell_node_idx in zip(connection_node_info, conn_indices):
+                    inner_node = b_inner * 4 + n_inner
+                    shell_node = shell_offset + shell_node_idx
+                    shell_bonds.append([inner_node, shell_node])
+
+            if len(shell_bonds) > 0:
+                shell_bonds = jnp.array(shell_bonds, dtype=int)
+                filtered_bonds = jnp.concatenate([filtered_bonds, shell_bonds], axis=0)
+
+            return filtered_bonds
+
+        self.bond_connectivity_org = bond_connectivity_org
+
+        def bond_connectivity():
+            """
+            Computes bonds' connectivity for a circle-shaped structure with shell blocks.
+            Connects inner blocks to shell blocks instead of boundary blocks.
+            Vertex enumeration is based only on blocks_inside.
+            """
+
+            # Create mapping from original block index to inner block index
+            # blocks_inside[i] -> inner block index i
+            # Make lookup array large enough to cover all possible block indices
+            total_blocks = self.n1_blocks * self.n2_blocks
+            # Create a lookup array: block_to_inner[original_block] = inner_block_idx or -1 if not in blocks_inside
+            block_to_inner = -jnp.ones(total_blocks, dtype=int)
+            block_to_inner = block_to_inner.at[self.blocks_inside].set(jnp.arange(len(self.blocks_inside)))
+
+            # Helper function to remap node index from full-grid to inner-only enumeration
+            def remap_node(original_node_idx):
+                """Remap node index from full-grid to inner-only enumeration."""
+                original_block = original_node_idx // 4
+                node_in_block = original_node_idx % 4
+                inner_block_idx = block_to_inner[original_block]
+                # If block is not in blocks_inside, return -1 (invalid)
+                return jnp.where(inner_block_idx >= 0, inner_block_idx * 4 + node_in_block, -1)
+
+            # Bonds between inner blocks (using full-grid indexing initially)
+            horizontal_bonds = jnp.array([
+                [self.n1_blocks * n2 * 4 + n1 * 4, self.n1_blocks * n2 * 4 + (n1 + 1) * 4 + 2]
+                for n2 in range(self.n2_blocks) for n1 in range(self.n1_blocks - 1)
+            ])
+            vertical_bonds = jnp.array([
+                [self.n1_blocks * n2 * 4 + n1 * 4 + 1, self.n1_blocks * (n2 + 1) * 4 + n1 * 4 + 1 + 2]
+                for n2 in range(self.n2_blocks - 1) for n1 in range(self.n1_blocks)
+            ])
+            bonds = jnp.concatenate([horizontal_bonds, vertical_bonds], axis=0)
+
+            # --- Map node indices to block indices ---
+            def bond_to_block(bond):
+                return bond // 4  # 4 nodes per block
+
+            bond_blocks = vmap(bond_to_block)(bonds)
+            b0 = bond_blocks[:, 0]
+            b1 = bond_blocks[:, 1]
+
+            # --- Keep only bonds between inner blocks ---
+            b0_inside = jnp.isin(b0, self.blocks_inside)
+            b1_inside = jnp.isin(b1, self.blocks_inside)
+            keep_mask = jnp.logical_and(b0_inside, b1_inside)
+            filtered_bonds = bonds[keep_mask]
+
+            # --- Remap node indices to inner-only enumeration ---
+            remap_node_vec = vmap(remap_node)
+            filtered_bonds = remap_node_vec(filtered_bonds)
+
+            # --- Add bonds from inner blocks to shell blocks ---
+            # Compute node offsets for shell blocks
+            offset_quads = 4 * len(self.blocks_inside)
+            shell_bonds = []
+
+            for count in range(self.n_piece):
+                conn_info = self.shell_connection_info[count]
+                connection_node_info = conn_info[3]  # (block_idx, node_idx) pairs - block_idx is original block index
+                conn_indices = conn_info[4]  # indices in shell block
+
+                shell_offset = offset_quads + sum(self.shell_node_counts[:count])
+
+                for (_, _, b_inner_orig, n_inner), shell_node_idx in zip(connection_node_info, conn_indices):
+                    # b_inner_orig is original block index, remap to inner block index
+                    inner_block_idx = block_to_inner[b_inner_orig]
+                    inner_node = inner_block_idx * 4 + n_inner
+                    shell_node = shell_offset + shell_node_idx
+                    shell_bonds.append([inner_node, shell_node])
+
+            if len(shell_bonds) > 0:
+                shell_bonds = jnp.array(shell_bonds, dtype=int)
+                filtered_bonds = jnp.concatenate([filtered_bonds, shell_bonds], axis=0)
+
+            return filtered_bonds
+
+        self.bond_connectivity = bond_connectivity
+
+        def reference_bond_vectors(horizontal_shift: jnp.ndarray, vertical_shift: jnp.ndarray):
+            """
+            Computes the reference configuration of the bonds including shell blocks.
+            """
+            # Get node positions from geometry functions
+            cnv = self.centroid_node_vectors(horizontal_shift, vertical_shift)  # tuple
+            bcc = self.block_centroids(horizontal_shift, vertical_shift)       # tuple
+
+            # Flatten to arrays
+            rel = jnp.vstack(list(cnv))                         # (n_nodes,2)
+            cents = jnp.vstack(list(bcc))                       # (n_blocks_total,2)
+            cents_rep = jnp.repeat(cents, self.block_node_counts, axis=0)
+            nodes_xy = cents_rep + rel                          # (n_nodes_total,2)
+
+            # Get bond connectivity
+            conn = self.bond_connectivity()
+
+            # Compute reference vectors
+            return nodes_xy[conn[:, 1], :] - nodes_xy[conn[:, 0], :]
+
+        self.reference_bond_vectors = reference_bond_vectors
+
+    def get_reference_geometry(self, horizontal_shift: jnp.ndarray, vertical_shift: jnp.ndarray):
+        """
+        Computes reference coonfiguration.
+        """
+        return super().get_reference_geometry(horizontal_shift, vertical_shift)
+
+    def get_xy_limits(self, vertices: jnp.ndarray):
+        """
+        Computes reference coonfiguration xy limits.
+        """
+
+        return compute_xy_limits(vertices)
+
+    def get_design_from_rotated_square(self, angle):
+        """Get horizontal and vertical shifts corresponding to a rotated square geometry with the given angle.
+
+        Args:
+            angle (float): Angle of the rotated square geometry.
+
+        Returns:
+            Tuple[jnp.ndarray, jnp.ndarray]: Tuple of horizontal and vertical shifts.
+        """
+
+        horizontal_shifts = jnp.array([[
+            (self.spacing - self.bond_length) / (2 * jnp.cos((-1)**(n1 + n2) * angle)) *
+            jnp.array([jnp.cos((-1)**(n1 + n2) * angle), jnp.sin((-1)**(n1 + n2) * angle)]) -
+            jnp.array([1, 0]) * (self.spacing - self.bond_length) / 2
+            for n2 in range(self.n2_blocks)] for n1 in range(self.n1_blocks+1)])
+        vertical_shifts = jnp.array([[
+            jnp.dot(
+                rotation_matrix(jnp.pi/2),
+                (self.spacing - self.bond_length) / (2 * jnp.cos((-1)**(n1 + n2) * angle)) *
+                jnp.array([jnp.cos((-1)**(n1 + n2) * angle), jnp.sin((-1)**(n1 + n2) * angle)]) -
+                jnp.array([1, 0]) * (self.spacing - self.bond_length) / 2
+            )
+            for n2 in range(self.n2_blocks+1)] for n1 in range(self.n1_blocks)])
+
+        return horizontal_shifts, vertical_shifts
+
+    def get_parametrization(self) -> Tuple[Callable, Callable, Callable, Callable]:
+        """Returns the set of functions parameterizing the geometry.
+
+        Returns:
+            Tuple[Callable, Callable, Callable, Callable]: parameterizing functions: block_centroids, centroid_node_vectors, bond_connectivity, reference_bond_vectors.
+        """
+
+        self.compute_geometry()
+
+        return self.block_centroids, self.centroid_node_vectors, self.bond_connectivity, self.reference_bond_vectors
+
+
 class QuadGeometry_Circle_InputSource(LatticeGeometry):
     """
     Circular structure and remove bonds between boundary blocks to make separate input sources.

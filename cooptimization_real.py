@@ -1,6 +1,3 @@
-import os,sys
-sys.path.append(os.path.dirname(os.getcwd()))
-
 from pathlib import Path
 from typing import NamedTuple, Any, Optional, List, Union, Tuple, Dict
 import dataclasses
@@ -32,8 +29,6 @@ import optax
 from jax_md.quantity import force
 import equinox as eqx
 from tqdm import trange, tqdm
-
-
 
 def build_viscous_damping(
         geometry: Geometry,
@@ -116,6 +111,7 @@ def build_RHS(energy_fn: Callable, loading_fn: Callable):
         loading_params = control_params.loading_params
         damping = control_params.mechanical_params.damping
         displacement, velocity = state
+
         dxdt = jnp.array([
             velocity,
             (potential_force(displacement, t, control_params) + loading_fn(state, t, loading_params, damping)) / inertia
@@ -220,8 +216,8 @@ def setup_dynamic_solver_all(
 
         # Solve ODE
         solver = diffrax.Tsit5()
+        # solver = diffrax.Kvaerno5()
         saveat = diffrax.SaveAt(ts=timepoints)
-
         solution = diffrax.diffeqsolve(diffrax.ODETerm(rhs), solver,
                                                 timepoints[0], timepoints[-1], dt0=None, y0=_state0, 
                                                 stepsize_controller=diffrax.PIDController(rtol=rtol, atol=atol),
@@ -331,11 +327,13 @@ def setup_dynamic_solver(
 
     jac_velocity = jacobian(velocity_fn, argnums=(0, 1, 2))
     def acceleration_fn(free_DOFs_total, t, control_params, inertia):
+        # print(free_DOFs_total.shape)
         free_DOFs = free_DOFs_total[0,:]
         free_DOFs_dot = free_DOFs_total[1,:]
     
         dvdx, dvdx_dot, dvdt = jac_velocity(free_DOFs, free_DOFs_dot, t, control_params.constraint_params)
-        acc_freeDOFs = rhs(free_DOFs_total, t, control_params, inertia)[1,:]
+        args = (control_params, inertia)
+        acc_freeDOFs = rhs(t, free_DOFs_total, args)[1,:]
         return dvdx @ free_DOFs_dot + dvdx_dot @ acc_freeDOFs + dvdt
 
     velocity_history_fn = vmap(velocity_fn, in_axes=(0, 0, 0, None))
@@ -356,6 +354,7 @@ def setup_dynamic_solver(
 
         # Solve ODE
         solver = diffrax.Tsit5()
+        # solver = diffrax.Kvaerno5()
         saveat = diffrax.SaveAt(ts=timepoints)
 
         solution = diffrax.diffeqsolve(diffrax.ODETerm(rhs), solver,
@@ -368,11 +367,11 @@ def setup_dynamic_solver(
         free_DOFs_solution = solution.ys
 
         # Reshape solution to global state.
-        displacement_history = displacement_history_fn(
-            free_DOFs_solution[:, 0, :],
-            timepoints,
-            control_params.constraint_params
-        )
+        # displacement_history = displacement_history_fn(
+        #     free_DOFs_solution[:, 0, :],
+        #     timepoints,
+        #     control_params.constraint_params
+        # )
         
         velocity_history = velocity_history_fn(
             free_DOFs_solution[:, 0, :],
@@ -381,11 +380,21 @@ def setup_dynamic_solver(
             control_params.constraint_params
         )
 
-        # solution = jnp.zeros((len(timepoints), 3)) # (len(timepoints), 2, geometry.n_blocks, 3) -> (len(timepoints), 3, geometry.n_blocks, 3)
+        acceleration_history = acceleration_history_fn(
+            free_DOFs_solution[:, 0:2, :],
+            timepoints,
+            control_params,
+            _inertia
+        )
+
+        solution = jnp.zeros((len(timepoints), 3)) # (len(timepoints), 2, geometry.n_blocks, 3) -> (len(timepoints), 3, geometry.n_blocks, 3)
         # solution = solution.at[:, 0, :].set(displacement_history[:,12,:])
         # solution = solution.at[:, 1, :].set(velocity_history[:,12,:])
-        center_idx = 48 # if n1_blocks = 5, n2_blocks = 5, then 12
-        solution = velocity_history[:,center_idx,:] # (len(timepoints), 3)
+        center_idx = geometry.n1_blocks * (geometry.n2_blocks//2 - 1) + geometry.n1_blocks // 2
+        print( "center_idx", center_idx )
+
+        solution = solution.at[:,:2].set( acceleration_history[:,center_idx,0:2] )
+        solution = solution.at[:,-1].set( velocity_history[:,center_idx,-1] )
         
         return solution
 

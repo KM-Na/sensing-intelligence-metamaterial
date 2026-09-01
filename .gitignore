@@ -13,3 +13,21 @@ figures/
 *.mp4
 *.mov
 *.avi
+
+# Raw reference copies of original (private) notebooks - not distributed
+reference/
+
+# Snapshot of the previous figure-reproduction deliverable, superseded by the
+# modular tutorial pipeline - kept locally, not distributed
+archive/
+
+# Experimental-force results and comparison notebook - not published, kept
+# locally only
+data/figure3_experimental_force.npz
+notebooks/compare_experimental_force_nn.ipynb
+
+# Data exporters that require --original-root pointing at the private
+# physical-intelligence-change folder - not runnable without it, kept
+# locally only
+scripts/export_forward_simulation_data.py
+scripts/export_figure_data.py
