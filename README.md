@@ -53,7 +53,7 @@ illustration of how the design gradient itself is computed.
    initial and optimized design (one shared train/test split and scaler,
    fit on the initial design) and plots test-loss history for both.
 3. **Comparing initial vs. optimized design** — `compare_gaussian_impulse_nn.ipynb`.
-   Loads the co-optimization loss curve, then trains a fresh CNN per design
+   Loads IMU measurement data from two differen designs, then trains a fresh CNN per design
    (same shared-split/shared-scaler approach) and compares test loss and
    example predictions before vs. after co-optimization.
 4. **Computing the design gradient** — `gradient_computation_demo.ipynb`.
@@ -88,9 +88,3 @@ python scripts/train_neural_network.py --structure circular_structure
 
 Every notebook and script here runs out of the box using the bundled
 `data/*.npz` files — no private data required.
-
-## Sanity-Check Scripts
-
-```bash
-python -m py_compile forward_simulation/*.py scripts/*.py cooptimization_real.py neural_networks.py
-```
